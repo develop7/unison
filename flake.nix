@@ -16,6 +16,7 @@
             unison-project = final.haskell-nix.project' {
               src = ./.;
               compiler-nix-name = "ghc8107";
+              projectFileName = "stack.yaml";
               shell = {
                 buildInputs = with pkgs; [ ];
                 tools = let ormolu-ver = "0.4.0.0";
