@@ -4,10 +4,12 @@ packages:
   unison-core
   unison-cli
   unison-share-api
+  unison-hashing-v2
 
   codebase2/codebase
   codebase2/codebase-sqlite
   codebase2/codebase-sync
+  codebase2/codebase-sqlite-hashing-v2
   codebase2/core
   codebase2/util
   codebase2/util-serialization
@@ -16,6 +18,8 @@ packages:
   lib/unison-prelude
   lib/unison-sqlite
   lib/unison-util-base32hex
+  lib/unison-util-base32hex-orphans-sqlite
+  lib/unison-util-base32hex-orphans-aeson
   lib/unison-util-relation
   lib/unison-pretty-printer
 
@@ -31,15 +35,10 @@ source-repository-package
 
 source-repository-package
   type: git
-  location: https://github.com/unisonweb/megaparsec.git
-  tag: c4463124c578e8d1074c04518779b5ce5957af6b
-
-source-repository-package
-  type: git
   location: https://github.com/unisonweb/shellmet.git
   tag: 2fd348592c8f51bb4c0ca6ba4bc8e38668913746
 
-allow-newer: 
+allow-newer:
   haskeline:base
 
 -- For now there is no way to apply ghc-options for all local packages
