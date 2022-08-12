@@ -10,7 +10,7 @@ module Unison.Share.Sync
 
     -- ** Push
     checkAndSetPush,
-    CheckAndSetPushError (..),
+    PushError (..),
     fastForwardPush,
     FastForwardPushError (..),
     UploadProgressCallbacks (..),
@@ -62,8 +62,6 @@ import qualified Unison.Sync.API as Share (API)
 import Unison.Sync.Common (causalHashToHash32, entityToTempEntity, expectEntity, hash32ToCausalHash)
 import qualified Unison.Sync.Types as Share
 import Unison.Util.Monoid (foldMapM)
-import qualified UnliftIO
-import UnliftIO.Exception (throwIO)
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Pile of constants
@@ -99,33 +97,35 @@ checkAndSetPush ::
   -- | The hash of our local causal to push.
   CausalHash ->
   UploadProgressCallbacks ->
-  IO (Either (SyncError CheckAndSetPushError) ())
-checkAndSetPush httpClient unisonShareUrl connect path expectedHash causalHash callbacks = catchSyncErrors do
+  IO (Either (SyncError PushError) ())
+checkAndSetPush httpClient unisonShareUrl connect path expectedHash causalHash callbacks = do
   -- Maybe the server already has this causal; try just setting its remote path. Commonly, it will respond that it needs
   -- this causal (UpdatePathMissingDependencies).
   updatePath >>= \case
-    Share.UpdatePathSuccess -> pure (Right ())
-    Share.UpdatePathHashMismatch mismatch -> pure (Left (CheckAndSetPushErrorHashMismatch mismatch))
-    Share.UpdatePathMissingDependencies (Share.NeedDependencies dependencies) -> do
+    Left err -> pure (Left (TransportError err))
+    Right Share.UpdatePathSuccess -> pure (Right ())
+    Right (Share.UpdatePathHashMismatch mismatch) -> pure (Left (SyncError (PushErrorHashMismatch mismatch)))
+    Right (Share.UpdatePathMissingDependencies (Share.NeedDependencies dependencies)) -> do
       -- Upload the causal and all of its dependencies.
       uploadEntities httpClient unisonShareUrl connect (Share.pathRepoName path) dependencies callbacks >>= \case
-        False -> pure (Left (CheckAndSetPushErrorNoWritePermission path))
-        True ->
+        Left err -> pure (Left err)
+        Right () ->
           -- After uploading the causal and all of its dependencies, try setting the remote path again.
-          updatePath <&> \case
-            Share.UpdatePathSuccess -> Right ()
+          updatePath >>= \case
+            Left err -> pure (Left (TransportError err))
+            Right Share.UpdatePathSuccess -> pure (Right ())
             -- Between the initial updatePath attempt and this one, someone else managed to update the path. That's ok;
             -- we still managed to upload our causal, but the push has indeed failed overall.
-            Share.UpdatePathHashMismatch mismatch -> Left (CheckAndSetPushErrorHashMismatch mismatch)
+            Right (Share.UpdatePathHashMismatch mismatch) -> pure (Left (SyncError (PushErrorHashMismatch mismatch)))
             -- Unexpected, but possible: we thought we uploaded all we needed to, yet the server still won't accept our
             -- causal. Bug in the client because we didn't upload enough? Bug in the server because we weren't told to
             -- upload some dependency? Who knows.
-            Share.UpdatePathMissingDependencies (Share.NeedDependencies dependencies) ->
-              Left (CheckAndSetPushErrorServerMissingDependencies dependencies)
-            Share.UpdatePathNoWritePermission _ -> Left (CheckAndSetPushErrorNoWritePermission path)
-    Share.UpdatePathNoWritePermission _ -> pure (Left (CheckAndSetPushErrorNoWritePermission path))
+            Right (Share.UpdatePathMissingDependencies (Share.NeedDependencies dependencies)) ->
+              pure (Left (SyncError (PushErrorServerMissingDependencies dependencies)))
+            Right (Share.UpdatePathNoWritePermission _) -> pure (Left (SyncError (PushErrorNoWritePermission path)))
+    Right (Share.UpdatePathNoWritePermission _) -> pure (Left (SyncError (PushErrorNoWritePermission path)))
   where
-    updatePath :: IO Share.UpdatePathResponse
+    updatePath :: IO (Either CodeserverTransportError Share.UpdatePathResponse)
     updatePath =
       httpUpdatePath
         httpClient
@@ -154,24 +154,26 @@ fastForwardPush ::
   CausalHash ->
   UploadProgressCallbacks ->
   IO (Either (SyncError FastForwardPushError) ())
-fastForwardPush httpClient unisonShareUrl connect path localHeadHash callbacks = catchSyncErrors do
+fastForwardPush httpClient unisonShareUrl connect path localHeadHash callbacks = do
   getCausalHashByPath httpClient unisonShareUrl path >>= \case
-    Left (GetCausalHashByPathErrorNoReadPermission _) -> pure (Left (FastForwardPushErrorNoReadPermission path))
-    Right Nothing -> pure (Left (FastForwardPushErrorNoHistory path))
-    Right (Just (Share.hashJWTHash -> remoteHeadHash)) -> do
+    Left err -> pure (Left (TransportError err))
+    Right (Left (GetCausalHashByPathErrorNoReadPermission _)) ->
+      pure (Left (SyncError (FastForwardPushErrorNoReadPermission path)))
+    Right (Right Nothing) -> pure (Left (SyncError (FastForwardPushErrorNoHistory path)))
+    Right (Right (Just (Share.hashJWTHash -> remoteHeadHash))) -> do
       let doLoadCausalSpineBetween = loadCausalSpineBetween remoteHeadHash (causalHashToHash32 localHeadHash)
       (connect \conn -> Sqlite.runTransaction conn doLoadCausalSpineBetween) >>= \case
         -- After getting the remote causal hash, we can tell from a local computation that this wouldn't be a
         -- fast-forward push, so we don't bother trying - just report the error now.
-        Nothing -> pure (Left (FastForwardPushErrorNotFastForward path))
+        Nothing -> pure (Left (SyncError (FastForwardPushErrorNotFastForward path)))
         -- The path from remote-to-local, excluding local, was empty. So, remote == local; there's nothing to push.
         Just [] -> pure (Right ())
         Just (_ : localInnerHashes0) -> do
           -- drop remote hash
           let localInnerHashes = map hash32ToCausalHash localInnerHashes0
           doUpload (localHeadHash :| localInnerHashes) >>= \case
-            False -> pure (Left (FastForwardPushErrorNoWritePermission path))
-            True -> do
+            Left err -> pure (Left (FastForwardPushError <$> err))
+            Right () -> do
               let doFastForwardPath =
                     httpFastForwardPath
                       httpClient
@@ -183,18 +185,21 @@ fastForwardPush httpClient unisonShareUrl connect path localHeadHash callbacks =
                           path
                         }
               doFastForwardPath <&> \case
-                Share.FastForwardPathSuccess -> Right ()
-                Share.FastForwardPathMissingDependencies (Share.NeedDependencies dependencies) ->
-                  Left (FastForwardPushErrorServerMissingDependencies dependencies)
+                Left err -> Left (TransportError err)
+                Right Share.FastForwardPathSuccess -> Right ()
+                Right (Share.FastForwardPathMissingDependencies (Share.NeedDependencies dependencies)) ->
+                  Left (SyncError (FastForwardPushError (PushErrorServerMissingDependencies dependencies)))
                 -- Weird: someone must have force-pushed no history here, or something. We observed a history at
                 -- this path but moments ago!
-                Share.FastForwardPathNoHistory -> Left (FastForwardPushErrorNoHistory path)
-                Share.FastForwardPathNoWritePermission _ -> Left (FastForwardPushErrorNoWritePermission path)
-                Share.FastForwardPathNotFastForward _ -> Left (FastForwardPushErrorNotFastForward path)
-                Share.FastForwardPathInvalidParentage (Share.InvalidParentage parent child) ->
-                  Left (FastForwardPushInvalidParentage parent child)
+                Right Share.FastForwardPathNoHistory -> Left (SyncError (FastForwardPushErrorNoHistory path))
+                Right (Share.FastForwardPathNoWritePermission _) ->
+                  Left (SyncError (FastForwardPushError (PushErrorNoWritePermission path)))
+                Right (Share.FastForwardPathNotFastForward _) ->
+                  Left (SyncError (FastForwardPushErrorNotFastForward path))
+                Right (Share.FastForwardPathInvalidParentage (Share.InvalidParentage parent child)) ->
+                  Left (SyncError (FastForwardPushInvalidParentage parent child))
   where
-    doUpload :: List.NonEmpty CausalHash -> IO Bool
+    doUpload :: List.NonEmpty CausalHash -> IO (Either (SyncError PushError) ())
     -- Maybe we could save round trips here by including the tail (or the head *and* the tail) as "extra hashes", but we
     -- don't have that API yet. So, we only upload the head causal entity (which we don't even know for sure the server
     -- doesn't have yet), and will (eventually) end up uploading the casuals in the tail that the server needs.
@@ -360,37 +365,40 @@ pull ::
   Share.Path ->
   DownloadProgressCallbacks ->
   IO (Either (SyncError PullError) CausalHash)
-pull httpClient unisonShareUrl connect repoPath callbacks = catchSyncErrors do
+pull httpClient unisonShareUrl connect repoPath callbacks = do
   getCausalHashByPath httpClient unisonShareUrl repoPath >>= \case
-    Left err -> pure (Left (PullErrorGetCausalHashByPath err))
+    Left err -> pure (Left (TransportError err))
+    Right (Left (GetCausalHashByPathErrorNoReadPermission _)) ->
+      pure (Left (SyncError (PullErrorNoReadPermission repoPath)))
     -- There's nothing at the remote path, so there's no causal to pull.
-    Right Nothing -> pure (Left (PullErrorNoHistoryAtPath repoPath))
-    Right (Just hashJwt) -> do
+    Right (Right Nothing) -> pure (Left (SyncError (PullErrorNoHistoryAtPath repoPath)))
+    Right (Right (Just hashJwt)) -> do
       let hash = Share.hashJWTHash hashJwt
-      maybeTempEntities <-
+      result <-
         connect \conn ->
           Sqlite.runTransaction conn (Q.entityLocation hash) >>= \case
-            Just Q.EntityInMainStorage -> pure Nothing
-            Just Q.EntityInTempStorage -> pure (Just (NESet.singleton hash))
+            Just Q.EntityInMainStorage -> pure (Right Nothing)
+            Just Q.EntityInTempStorage -> pure (Right (Just (NESet.singleton hash)))
             Nothing -> do
               toDownload callbacks 1
-              Share.DownloadEntitiesSuccess entities <-
-                httpDownloadEntities
-                  httpClient
-                  unisonShareUrl
-                  Share.DownloadEntitiesRequest {repoName, hashes = NESet.singleton hashJwt}
-              tempEntities <- insertEntities conn entities
-              downloaded callbacks 1
-              pure (NESet.nonEmptySet tempEntities)
-      whenJust maybeTempEntities \tempEntities ->
-        completeTempEntities
-          httpClient
-          unisonShareUrl
-          connect
-          repoName
-          callbacks
-          tempEntities
-      pure (Right (hash32ToCausalHash hash))
+              let request = Share.DownloadEntitiesRequest {repoName, hashes = NESet.singleton hashJwt}
+              httpDownloadEntities httpClient unisonShareUrl request >>= \case
+                Left err -> pure (Left (TransportError err))
+                Right (Share.DownloadEntitiesSuccess entities) -> do
+                  tempEntities <- insertEntities conn entities
+                  downloaded callbacks 1
+                  pure (Right (NESet.nonEmptySet tempEntities))
+                Right (Share.DownloadEntitiesNoReadPermission _) ->
+                  pure (Left (SyncError (PullErrorNoReadPermission repoPath)))
+      case result of
+        Left err -> pure (Left err)
+        Right maybeTempEntities -> do
+          case maybeTempEntities of
+            Nothing -> pure (Right (hash32ToCausalHash hash))
+            Just tempEntities ->
+              completeTempEntities httpClient unisonShareUrl connect repoName callbacks tempEntities >>= \case
+                Left err -> pure (Left err)
+                Right () -> pure (Right (hash32ToCausalHash hash))
   where
     repoName = Share.pathRepoName repoPath
 
@@ -411,8 +419,9 @@ recordNotWorking sem =
 
 -- What the dispatcher is to do
 data DispatcherJob
-  = DispatcherForkWorker (NESet Share.HashJWT)
-  | DispatcherDone
+  = DispatcherDone
+  | DispatcherForkWorker (NESet Share.HashJWT)
+  | DispatcherWorkerError (SyncError PullError)
 
 -- | Finish downloading entities from Unison Share. Returns the total number of entities downloaded.
 --
@@ -425,7 +434,7 @@ completeTempEntities ::
   Share.RepoName ->
   DownloadProgressCallbacks ->
   NESet Hash32 ->
-  IO ()
+  IO (Either (SyncError PullError) ())
 completeTempEntities httpClient unisonShareUrl connect repoName callbacks initialNewTempEntities = do
   -- The set of hashes we still need to download
   hashesVar <- newTVarIO Set.empty
@@ -463,13 +472,38 @@ completeTempEntities httpClient unisonShareUrl connect repoName callbacks initia
       TQueue (NESet Share.HashJWT, NEMap Hash32 (Share.Entity Text Hash32 Share.HashJWT)) ->
       TQueue (Set Share.HashJWT, Maybe (NESet Hash32)) ->
       WorkerCount ->
-      IO ()
-    dispatcher hashesVar uninsertedHashesVar entitiesQueue newTempEntitiesQueue workerCount =
+      IO (Either (SyncError PullError) ())
+    dispatcher hashesVar uninsertedHashesVar entitiesQueue newTempEntitiesQueue workerCount = do
+      errVar <- newEmptyTMVarIO
+
+      let checkForErrMode :: STM DispatcherJob
+          checkForErrMode = do
+            err <- readTMVar errVar
+            pure (DispatcherWorkerError err)
+
+      let dispatchWorkMode :: STM DispatcherJob
+          dispatchWorkMode = do
+            hashes <- readTVar hashesVar
+            check (not (Set.null hashes))
+            let (hashes1, hashes2) = Set.splitAt 50 hashes
+            modifyTVar' uninsertedHashesVar (Set.union hashes1)
+            writeTVar hashesVar hashes2
+            pure (DispatcherForkWorker (NESet.unsafeFromSet hashes1))
+
+      let -- Check to see if there are no hashes left to download, no outstanding workers, and no work in either queue
+          checkIfDoneMode :: STM DispatcherJob
+          checkIfDoneMode = do
+            workers <- readTVar workerCount
+            check (workers == 0)
+            isEmptyTQueue entitiesQueue >>= check
+            isEmptyTQueue newTempEntitiesQueue >>= check
+            pure DispatcherDone
+
       Ki.scoped \scope ->
-        let loop :: IO ()
+        let loop :: IO (Either (SyncError PullError) ())
             loop =
-              atomically (dispatchWorkMode <|> checkIfDoneMode) >>= \case
-                DispatcherDone -> pure ()
+              atomically (checkForErrMode <|> dispatchWorkMode <|> checkIfDoneMode) >>= \case
+                DispatcherDone -> pure (Right ())
                 DispatcherForkWorker hashes -> do
                   atomically do
                     -- Limit number of simultaneous downloaders (plus 2, for inserter and elaborator)
@@ -480,44 +514,33 @@ completeTempEntities httpClient unisonShareUrl connect repoName callbacks initia
                     -- nothing more for the dispatcher to do, when in fact a downloader thread just hasn't made it as
                     -- far as recording its own existence
                     recordWorking workerCount
-                  _ <- Ki.fork @() scope (downloader entitiesQueue workerCount hashes)
+                  _ <- Ki.fork @() scope (downloader entitiesQueue workerCount errVar hashes)
                   loop
+                DispatcherWorkerError err -> pure (Left err)
          in loop
-      where
-        dispatchWorkMode :: STM DispatcherJob
-        dispatchWorkMode = do
-          hashes <- readTVar hashesVar
-          check (not (Set.null hashes))
-          let (hashes1, hashes2) = Set.splitAt 50 hashes
-          modifyTVar' uninsertedHashesVar (Set.union hashes1)
-          writeTVar hashesVar hashes2
-          pure (DispatcherForkWorker (NESet.unsafeFromSet hashes1))
-
-        -- Check to see if there are no hashes left to download, no outstanding workers, and no work in either queue
-        checkIfDoneMode :: STM DispatcherJob
-        checkIfDoneMode = do
-          workers <- readTVar workerCount
-          check (workers == 0)
-          isEmptyTQueue entitiesQueue >>= check
-          isEmptyTQueue newTempEntitiesQueue >>= check
-          pure DispatcherDone
 
     -- Downloader thread: download entities, enqueue to `entitiesQueue`
     downloader ::
       TQueue (NESet Share.HashJWT, NEMap Hash32 (Share.Entity Text Hash32 Share.HashJWT)) ->
       WorkerCount ->
+      TMVar (SyncError PullError) ->
       NESet Share.HashJWT ->
       IO ()
-    downloader entitiesQueue workerCount hashes = do
-      Share.DownloadEntitiesSuccess entities <-
-        httpDownloadEntities
-          httpClient
-          unisonShareUrl
-          Share.DownloadEntitiesRequest {repoName, hashes}
-      downloaded callbacks (NESet.size hashes)
-      atomically do
-        writeTQueue entitiesQueue (hashes, entities)
-        recordNotWorking workerCount
+    downloader entitiesQueue workerCount errVar hashes = do
+      httpDownloadEntities httpClient unisonShareUrl Share.DownloadEntitiesRequest {repoName, hashes} >>= \case
+        Left err ->
+          atomically do
+            _ <- tryPutTMVar errVar (TransportError err)
+            recordNotWorking workerCount
+        Right (Share.DownloadEntitiesSuccess entities) -> do
+          downloaded callbacks (NESet.size hashes)
+          atomically do
+            writeTQueue entitiesQueue (hashes, entities)
+            recordNotWorking workerCount
+        Right (Share.DownloadEntitiesNoReadPermission _) -> do
+          atomically do
+            _ <- tryPutTMVar errVar (SyncError (PullErrorNoReadPermission wundefined))
+            recordNotWorking workerCount
 
     -- Inserter thread: dequeue from `entitiesQueue`, insert entities, enqueue to `newTempEntitiesQueue`
     inserter ::
@@ -600,11 +623,13 @@ getCausalHashByPath ::
   -- | The Unison Share URL.
   BaseUrl ->
   Share.Path ->
-  IO (Either GetCausalHashByPathError (Maybe Share.HashJWT))
+  IO (Either CodeserverTransportError (Either GetCausalHashByPathError (Maybe Share.HashJWT)))
 getCausalHashByPath httpClient unisonShareUrl repoPath =
   httpGetCausalHashByPath httpClient unisonShareUrl (Share.GetCausalHashByPathRequest repoPath) <&> \case
-    Share.GetCausalHashByPathSuccess maybeHashJwt -> Right maybeHashJwt
-    Share.GetCausalHashByPathNoReadPermission _ -> Left (GetCausalHashByPathErrorNoReadPermission repoPath)
+    Left err -> Left err
+    Right (Share.GetCausalHashByPathSuccess maybeHashJwt) -> Right (Right maybeHashJwt)
+    Right (Share.GetCausalHashByPathNoReadPermission _) ->
+      Right (Left (GetCausalHashByPathErrorNoReadPermission repoPath))
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Upload entities
@@ -618,7 +643,7 @@ data UploadProgressCallbacks = UploadProgressCallbacks
   }
 
 data UploadDispatcherJob
-  = UploadDispatcherReturnFailure
+  = UploadDispatcherReturnFailure (SyncError PushError)
   | UploadDispatcherForkWorkerWhenAvailable (NESet Hash32)
   | UploadDispatcherForkWorker (NESet Hash32)
   | UploadDispatcherDone
@@ -635,7 +660,7 @@ uploadEntities ::
   Share.RepoName ->
   NESet Hash32 ->
   UploadProgressCallbacks ->
-  IO Bool
+  IO (Either (SyncError PushError) ())
 uploadEntities httpClient unisonShareUrl connect repoName hashes0 callbacks = do
   hashesVar <- newTVarIO (NESet.toSet hashes0)
   -- Semantically, this is the set of hashes we've uploaded so far, but we do delete from it when it's safe to, so it
@@ -658,19 +683,19 @@ uploadEntities httpClient unisonShareUrl connect repoName hashes0 callbacks = do
       TVar (Set Hash32) ->
       TVar Int ->
       TVar (Set Int) ->
-      TMVar () ->
-      IO Bool
+      TMVar (SyncError PushError) ->
+      IO (Either (SyncError PushError) ())
     dispatcher scope hashesVar dedupeVar nextWorkerIdVar workersVar workerFailedVar = do
       loop
       where
-        loop :: IO Bool
+        loop :: IO (Either (SyncError PushError) ())
         loop =
           doJob [checkForFailureMode, dispatchWorkMode, checkIfDoneMode]
 
-        doJob :: [STM UploadDispatcherJob] -> IO Bool
+        doJob :: [STM UploadDispatcherJob] -> IO (Either (SyncError PushError) ())
         doJob jobs =
           atomically (asum jobs) >>= \case
-            UploadDispatcherReturnFailure -> pure False
+            UploadDispatcherReturnFailure err -> pure (Left err)
             UploadDispatcherForkWorkerWhenAvailable hashes -> doJob [forkWorkerMode hashes, checkForFailureMode]
             UploadDispatcherForkWorker hashes -> do
               workerId <-
@@ -683,12 +708,12 @@ uploadEntities httpClient unisonShareUrl connect repoName hashes0 callbacks = do
                 Ki.fork @() scope do
                   worker hashesVar dedupeVar workersVar workerFailedVar workerId hashes
               loop
-            UploadDispatcherDone -> pure True
+            UploadDispatcherDone -> pure (Right ())
 
         checkForFailureMode :: STM UploadDispatcherJob
         checkForFailureMode = do
-          () <- readTMVar workerFailedVar
-          pure UploadDispatcherReturnFailure
+          err <- readTMVar workerFailedVar
+          pure (UploadDispatcherReturnFailure err)
 
         dispatchWorkMode :: STM UploadDispatcherJob
         dispatchWorkMode = do
@@ -711,7 +736,14 @@ uploadEntities httpClient unisonShareUrl connect repoName hashes0 callbacks = do
           when (not (Set.null workers)) retry
           pure UploadDispatcherDone
 
-    worker :: TVar (Set Hash32) -> TVar (Set Hash32) -> TVar (Set Int) -> TMVar () -> Int -> NESet Hash32 -> IO ()
+    worker ::
+      TVar (Set Hash32) ->
+      TVar (Set Hash32) ->
+      TVar (Set Int) ->
+      TMVar (SyncError PushError) ->
+      Int ->
+      NESet Hash32 ->
+      IO ()
     worker hashesVar dedupeVar workersVar workerFailedVar workerId hashes = do
       entities <-
         fmap NEMap.fromAscList do
@@ -723,13 +755,16 @@ uploadEntities httpClient unisonShareUrl connect repoName hashes0 callbacks = do
 
       result <-
         httpUploadEntities httpClient unisonShareUrl Share.UploadEntitiesRequest {entities, repoName} <&> \case
-          Share.UploadEntitiesNeedDependencies (Share.NeedDependencies moreHashes) -> Right (NESet.toSet moreHashes)
-          Share.UploadEntitiesNoWritePermission _ -> Left ()
-          Share.UploadEntitiesHashMismatchForEntity _ -> error "hash mismatch; fixme"
-          Share.UploadEntitiesSuccess -> Right Set.empty
+          Left err -> Left (TransportError err)
+          Right (Share.UploadEntitiesNeedDependencies (Share.NeedDependencies moreHashes)) ->
+            Right (NESet.toSet moreHashes)
+          Right (Share.UploadEntitiesNoWritePermission _) -> Left (SyncError (PushErrorNoWritePermission wundefined))
+          Right (Share.UploadEntitiesHashMismatchForEntity mismatch) ->
+            Left (SyncError (PushErrorHashMismatchForEntity mismatch))
+          Right Share.UploadEntitiesSuccess -> Right Set.empty
 
       case result of
-        Left () -> void (atomically (tryPutTMVar workerFailedVar ()))
+        Left err -> void (atomically (tryPutTMVar workerFailedVar err))
         Right moreHashes -> do
           uploaded callbacks (NESet.size hashes)
           (maybeYoungestWorkerThatWasAlive, numNewHashes) <-
@@ -824,11 +859,31 @@ upsertEntitySomewhere hash entity =
 ------------------------------------------------------------------------------------------------------------------------
 -- HTTP calls
 
-httpGetCausalHashByPath :: Auth.AuthenticatedHttpClient -> BaseUrl -> Share.GetCausalHashByPathRequest -> IO Share.GetCausalHashByPathResponse
-httpFastForwardPath :: Auth.AuthenticatedHttpClient -> BaseUrl -> Share.FastForwardPathRequest -> IO Share.FastForwardPathResponse
-httpUpdatePath :: Auth.AuthenticatedHttpClient -> BaseUrl -> Share.UpdatePathRequest -> IO Share.UpdatePathResponse
-httpDownloadEntities :: Auth.AuthenticatedHttpClient -> BaseUrl -> Share.DownloadEntitiesRequest -> IO Share.DownloadEntitiesResponse
-httpUploadEntities :: Auth.AuthenticatedHttpClient -> BaseUrl -> Share.UploadEntitiesRequest -> IO Share.UploadEntitiesResponse
+httpGetCausalHashByPath ::
+  Auth.AuthenticatedHttpClient ->
+  BaseUrl ->
+  Share.GetCausalHashByPathRequest ->
+  IO (Either CodeserverTransportError Share.GetCausalHashByPathResponse)
+httpFastForwardPath ::
+  Auth.AuthenticatedHttpClient ->
+  BaseUrl ->
+  Share.FastForwardPathRequest ->
+  IO (Either CodeserverTransportError Share.FastForwardPathResponse)
+httpUpdatePath ::
+  Auth.AuthenticatedHttpClient ->
+  BaseUrl ->
+  Share.UpdatePathRequest ->
+  IO (Either CodeserverTransportError Share.UpdatePathResponse)
+httpDownloadEntities ::
+  Auth.AuthenticatedHttpClient ->
+  BaseUrl ->
+  Share.DownloadEntitiesRequest ->
+  IO (Either CodeserverTransportError Share.DownloadEntitiesResponse)
+httpUploadEntities ::
+  Auth.AuthenticatedHttpClient ->
+  BaseUrl ->
+  Share.UploadEntitiesRequest ->
+  IO (Either CodeserverTransportError Share.UploadEntitiesResponse)
 ( httpGetCausalHashByPath,
   httpFastForwardPath,
   httpUpdatePath,
@@ -852,49 +907,47 @@ httpUploadEntities :: Auth.AuthenticatedHttpClient -> BaseUrl -> Share.UploadEnt
           go httpUploadEntities
         )
     where
-      hoist :: Servant.ClientM a -> ReaderT Servant.ClientEnv IO a
+      hoist :: Servant.ClientM a -> ReaderT Servant.ClientEnv (ExceptT CodeserverTransportError IO) a
       hoist m = do
         clientEnv <- Reader.ask
         liftIO (Servant.runClientM m clientEnv) >>= \case
           Right a -> pure a
           Left err -> do
             Debug.debugLogM Debug.Sync (show err)
-            throwIO case err of
-              Servant.FailureResponse _req resp ->
-                case HTTP.statusCode $ Servant.responseStatusCode resp of
-                  401 -> Unauthenticated (Servant.baseUrl clientEnv)
-                  -- The server should provide semantically relevant permission-denied messages
-                  -- when possible, but this should catch any we miss.
-                  403 -> PermissionDenied (Text.Lazy.toStrict . Text.Lazy.decodeUtf8 $ Servant.responseBody resp)
-                  408 -> Timeout
-                  429 -> RateLimitExceeded
-                  504 -> Timeout
-                  _ -> UnexpectedResponse resp
-              Servant.DecodeFailure msg resp -> DecodeFailure msg resp
-              Servant.UnsupportedContentType _ct resp -> UnexpectedResponse resp
-              Servant.InvalidContentTypeHeader resp -> UnexpectedResponse resp
-              Servant.ConnectionError _ -> UnreachableCodeserver (Servant.baseUrl clientEnv)
+            throwError (fromServantClientError clientEnv err)
+        where
+          fromServantClientError :: Servant.ClientEnv -> Servant.ClientError -> CodeserverTransportError
+          fromServantClientError clientEnv = \case
+            Servant.FailureResponse _req resp ->
+              case HTTP.statusCode $ Servant.responseStatusCode resp of
+                401 -> Unauthenticated (Servant.baseUrl clientEnv)
+                -- The server should provide semantically relevant permission-denied messages
+                -- when possible, but this should catch any we miss.
+                403 -> PermissionDenied (Text.Lazy.toStrict . Text.Lazy.decodeUtf8 $ Servant.responseBody resp)
+                408 -> Timeout
+                429 -> RateLimitExceeded
+                504 -> Timeout
+                _ -> UnexpectedResponse resp
+            Servant.DecodeFailure msg resp -> DecodeFailure msg resp
+            Servant.UnsupportedContentType _ct resp -> UnexpectedResponse resp
+            Servant.InvalidContentTypeHeader resp -> UnexpectedResponse resp
+            Servant.ConnectionError _ -> UnreachableCodeserver (Servant.baseUrl clientEnv)
 
       go ::
-        (req -> ReaderT Servant.ClientEnv IO resp) ->
+        (req -> ReaderT Servant.ClientEnv (ExceptT CodeserverTransportError IO) resp) ->
         Auth.AuthenticatedHttpClient ->
         BaseUrl ->
         req ->
-        IO resp
+        IO (Either CodeserverTransportError resp)
       go f (Auth.AuthenticatedHttpClient httpClient) unisonShareUrl req =
-        runReaderT
-          (f req)
-          (Servant.mkClientEnv httpClient unisonShareUrl)
-            { Servant.makeClientRequest = \url request ->
-                -- Disable client-side timeouts
-                (Servant.defaultMakeClientRequest url request)
-                  { Http.Client.responseTimeout = Http.Client.responseTimeoutNone
+        f req
+          & ( `runReaderT`
+                (Servant.mkClientEnv httpClient unisonShareUrl)
+                  { Servant.makeClientRequest = \url request ->
+                      -- Disable client-side timeouts
+                      (Servant.defaultMakeClientRequest url request)
+                        { Http.Client.responseTimeout = Http.Client.responseTimeoutNone
+                        }
                   }
-            }
-
-catchSyncErrors :: IO (Either e a) -> IO (Either (SyncError e) a)
-catchSyncErrors action =
-  UnliftIO.try @_ @CodeserverTransportError action >>= \case
-    Left te -> pure (Left . TransportError $ te)
-    Right (Left e) -> pure . Left . SyncError $ e
-    Right (Right a) -> pure $ Right a
+            )
+          & runExceptT
