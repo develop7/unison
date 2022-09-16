@@ -18,6 +18,8 @@ module Unison.Prelude
     whenJustM,
     eitherToMaybe,
     maybeToEither,
+    runMaybeTDefault,
+    guardMaybe,
 
     -- * @Either@ control flow
     onLeft,
@@ -73,6 +75,15 @@ import Text.Read as X (readMaybe)
 import UnliftIO as X (MonadUnliftIO (..), askRunInIO, askUnliftIO, try, withUnliftIO)
 import qualified UnliftIO
 import Witherable as X (filterA, forMaybe, mapMaybe, wither, witherMap)
+
+runMaybeTDefault :: Functor m => a -> MaybeT m a -> m a
+runMaybeTDefault def = fmap (fromMaybe def) . runMaybeT
+
+-- | Useful for lifting 'maybe's into MaybeT or [].
+guardMaybe :: Alternative m => Maybe a -> m a
+guardMaybe = \case
+  Just a -> pure a
+  Nothing -> empty
 
 -- | E.g.
 --

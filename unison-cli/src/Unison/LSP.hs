@@ -31,6 +31,7 @@ import qualified Unison.LSP.HandlerUtils as Handlers
 import Unison.LSP.Hover (hoverHandler)
 import qualified Unison.LSP.NotificationHandlers as Notifications
 import Unison.LSP.Orphans ()
+import Unison.LSP.SelectionRange (selectionRangeHandler)
 import Unison.LSP.Types
 import Unison.LSP.UCMWorker (ucmWorker)
 import qualified Unison.LSP.VFS as VFS
@@ -125,6 +126,7 @@ lspRequestHandlers =
     & SMM.insert STextDocumentHover (mkHandler hoverHandler)
     & SMM.insert STextDocumentCodeAction (mkHandler codeActionHandler)
     & SMM.insert STextDocumentFoldingRange (mkHandler foldingRangeRequest)
+    & SMM.insert STextDocumentSelectionRange (mkHandler selectionRangeHandler)
   where
     defaultTimeout = 10_000 -- 10s
     mkHandler ::

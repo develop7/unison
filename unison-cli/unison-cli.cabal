@@ -73,6 +73,7 @@ library
       Unison.LSP.Hover
       Unison.LSP.NotificationHandlers
       Unison.LSP.Orphans
+      Unison.LSP.SelectionRange
       Unison.LSP.Types
       Unison.LSP.UCMWorker
       Unison.LSP.VFS
